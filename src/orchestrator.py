@@ -1,78 +1,49 @@
-import asyncio
-from typing import Dict, List, Optional, Callable, Any
-from dataclasses import dataclass
-from enum import Enum
-from datetime import datetime
-import heapq
+import time
+import threading
+import logging
 
-class TaskPriority(Enum):
-    HIGH = 0
-    MEDIUM = 1
-    LOW = 2
+class TaskScheduler:
+    def __init__(self, max_concurrent_tasks=5):
+        self.max_concurrent_tasks = max_concurrent_tasks
+        self.task_queue = []
+        self.active_tasks = []
+        self.lock = threading.Lock()
 
-@dataclass(order=True)
+    def schedule_task(self, task):
+        with self.lock:
+            self.task_queue.append(task)
+            self.process_queue()
+
+    def process_queue(self):
+        while len(self.active_tasks) < self.max_concurrent_tasks and self.task_queue:
+            task = self.task_queue.pop(0)
+            self.active_tasks.append(task)
+            threading.Thread(target=self.execute_task, args=(task,)).start()
+
+    def execute_task(self, task):
+        try:
+            task.execute()
+        except Exception as e:
+            logging.error(f"Error executing task: {e}")
+        finally:
+            with self.lock:
+                self.active_tasks.remove(task)
+                self.process_queue()
+
 class Task:
-    priority: TaskPriority
-    timestamp: datetime
-    name: str
-    callback: Callable
-    args: tuple = ()
-    kwargs: Dict[str, Any] = None
+    def __init__(self, name, function, *args, **kwargs):
+        self.name = name
+        self.function = function
+        self.args = args
+        self.kwargs = kwargs
 
-    def __post_init__(self):
-        self.kwargs = self.kwargs or {}
+    def execute(self):
+        self.function(*self.args, **self.kwargs)
 
 class Orchestrator:
     def __init__(self):
-        self._task_queue: List[Task] = []
-        self._running = False
-        self._results: Dict[str, Any] = {}
+        self.task_scheduler = TaskScheduler()
 
-    async def submit_task(self, name: str, callback: Callable,
-                         priority: TaskPriority = TaskPriority.MEDIUM,
-                         *args, **kwargs) -> None:
-        task = Task(
-            priority=priority,
-            timestamp=datetime.now(),
-            name=name,
-            callback=callback,
-            args=args,
-            kwargs=kwargs
-        )
-        heapq.heappush(self._task_queue, task)
-
-    async def execute_task(self, task: Task) -> Any:
-        try:
-            if asyncio.iscoroutinefunction(task.callback):
-                result = await task.callback(*task.args, **task.kwargs)
-            else:
-                result = task.callback(*task.args, **task.kwargs)
-            self._results[task.name] = result
-            return result
-        except Exception as e:
-            self._results[task.name] = e
-            raise
-
-    async def run(self):
-        self._running = True
-        while self._running and self._task_queue:
-            task = heapq.heappop(self._task_queue)
-            await self.execute_task(task)
-
-    def stop(self):
-        self._running = False
-
-    def get_result(self, task_name: str) -> Optional[Any]:
-        return self._results.get(task_name)
-
-    @property
-    def pending_tasks(self) -> int:
-        return len(self._task_queue)
-
-    @property
-    def results(self) -> Dict[str, Any]:
-        return self._results.copy()
-
-    async def clear(self):
-        self._task_queue.clear()
-        self._results.clear()
+    def run_task(self, name, function, *args, **kwargs):
+        task = Task(name, function, *args, **kwargs)
+        self.task_scheduler.schedule_task(task)
