@@ -1,78 +1,78 @@
-import zmq
-import json
-import uuid
-from typing import Dict, List, Any
+import asyncio
+from typing import Dict, List, Optional, Callable, Any
+from dataclasses import dataclass
+from enum import Enum
 from datetime import datetime
+import heapq
 
-class TaskOrchestrator:
-    def __init__(self, host: str = '*', port: int = 5555):
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.ROUTER)
-        self.socket.bind(f'tcp://{host}:{port}')
-        self.tasks: Dict[str, Dict] = {}
-        self.workers: Dict[str, datetime] = {}
+class TaskPriority(Enum):
+    HIGH = 0
+    MEDIUM = 1
+    LOW = 2
 
-    def register_worker(self, worker_id: str) -> None:
-        self.workers[worker_id] = datetime.now()
+@dataclass(order=True)
+class Task:
+    priority: TaskPriority
+    timestamp: datetime
+    name: str
+    callback: Callable
+    args: tuple = ()
+    kwargs: Dict[str, Any] = None
 
-    def submit_task(self, task_spec: Dict[str, Any]) -> str:
-        task_id = str(uuid.uuid4())
-        self.tasks[task_id] = {
-            'spec': task_spec,
-            'status': 'pending',
-            'created_at': datetime.now(),
-            'worker_id': None
-        }
-        return task_id
+    def __post_init__(self):
+        self.kwargs = self.kwargs or {}
 
-    def assign_task(self, worker_id: str) -> Dict[str, Any]:
-        available_tasks = [
-            (tid, task) for tid, task in self.tasks.items()
-            if task['status'] == 'pending'
-        ]
-        if not available_tasks:
-            return None
+class Orchestrator:
+    def __init__(self):
+        self._task_queue: List[Task] = []
+        self._running = False
+        self._results: Dict[str, Any] = {}
 
-        task_id, task = available_tasks[0]
-        task['status'] = 'running'
-        task['worker_id'] = worker_id
-        return {'task_id': task_id, 'spec': task['spec']}
+    async def submit_task(self, name: str, callback: Callable,
+                         priority: TaskPriority = TaskPriority.MEDIUM,
+                         *args, **kwargs) -> None:
+        task = Task(
+            priority=priority,
+            timestamp=datetime.now(),
+            name=name,
+            callback=callback,
+            args=args,
+            kwargs=kwargs
+        )
+        heapq.heappush(self._task_queue, task)
 
-    def update_task_status(self, task_id: str, status: str, result: Any = None) -> None:
-        if task_id in self.tasks:
-            self.tasks[task_id].update({
-                'status': status,
-                'result': result,
-                'completed_at': datetime.now()
-            })
+    async def execute_task(self, task: Task) -> Any:
+        try:
+            if asyncio.iscoroutinefunction(task.callback):
+                result = await task.callback(*task.args, **task.kwargs)
+            else:
+                result = task.callback(*task.args, **task.kwargs)
+            self._results[task.name] = result
+            return result
+        except Exception as e:
+            self._results[task.name] = e
+            raise
 
-    def run(self) -> None:
-        print('Task Orchestrator started...')
-        while True:
-            worker_id, *msg_parts = self.socket.recv_multipart()
-            message = json.loads(msg_parts[-1].decode())
-            
-            if message['type'] == 'register':
-                self.register_worker(worker_id.decode())
-                response = {'status': 'registered'}
-            
-            elif message['type'] == 'request_task':
-                task = self.assign_task(worker_id.decode())
-                response = {'status': 'task_assigned', 'task': task}
-            
-            elif message['type'] == 'task_complete':
-                self.update_task_status(
-                    message['task_id'],
-                    'completed',
-                    message.get('result')
-                )
-                response = {'status': 'acknowledged'}
-            
-            self.socket.send_multipart([
-                worker_id,
-                json.dumps(response).encode()
-            ])
+    async def run(self):
+        self._running = True
+        while self._running and self._task_queue:
+            task = heapq.heappop(self._task_queue)
+            await self.execute_task(task)
 
-if __name__ == '__main__':
-    orchestrator = TaskOrchestrator()
-    orchestrator.run()
+    def stop(self):
+        self._running = False
+
+    def get_result(self, task_name: str) -> Optional[Any]:
+        return self._results.get(task_name)
+
+    @property
+    def pending_tasks(self) -> int:
+        return len(self._task_queue)
+
+    @property
+    def results(self) -> Dict[str, Any]:
+        return self._results.copy()
+
+    async def clear(self):
+        self._task_queue.clear()
+        self._results.clear()
