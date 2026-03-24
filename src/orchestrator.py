@@ -1,50 +1,52 @@
-import json
-import asyncio
+import os
+import yaml
 from typing import Dict, List
-from web3 import Web3
+from kubernetes import client, config
 
-class Orchestrator:
-    def __init__(self, config: Dict):
-        self.config = config
-        self.chains = {}
+class DeploymentOrchestrator:
+    def __init__(self, config_file: str = 'config.yaml'):
+        with open(config_file, 'r') as f:
+            self.config = yaml.safe_load(f)
+        
+        config.load_kube_config()
+        self.api = client.AppsV1Api()
 
-    async def initialize(self):
-        for chain_config in self.config['chains']:
-            chain = await self.initialize_chain(chain_config)
-            self.chains[chain_config['name']] = chain
+    def deploy_services(self, services: List[str]) -> None:
+        for service in services:
+            service_config = self.config['services'][service]
+            self.create_deployment(service, service_config)
+            self.create_service(service, service_config)
 
-    async def initialize_chain(self, config: Dict) -> 'ChainAdapter':
-        provider = Web3.HTTPProvider(config['rpc_url'])
-        w3 = Web3(provider)
-        return ChainAdapter(w3, config)
-
-    async def execute_workflow(self, workflow: Dict):
-        tasks = []
-        for step in workflow['steps']:
-            chain_name = step['chain']
-            chain = self.chains[chain_name]
-            task = asyncio.create_task(chain.execute_step(step))
-            tasks.append(task)
-        await asyncio.gather(*tasks)
-
-class ChainAdapter:
-    def __init__(self, w3: Web3, config: Dict):
-        self.w3 = w3
-        self.config = config
-
-    async def execute_step(self, step: Dict):
-        contract = self.w3.eth.contract(
-            address=step['contract_address'],
-            abi=json.load(open(step['abi_path']))
+    def create_deployment(self, service: str, config: Dict) -> None:
+        deployment = client.V1Deployment(
+            metadata=client.V1ObjectMeta(name=service),
+            spec=client.V1DeploymentSpec(
+                replicas=config['replicas'],
+                selector=client.V1LabelSelector(
+                    match_labels={'app': service}
+                ),
+                template=client.V1PodTemplateSpec(
+                    metadata=client.V1ObjectMeta(labels={'app': service}),
+                    spec=client.V1PodSpec(
+                        containers=[
+                            client.V1Container(
+                                name=service,
+                                image=config['image'],
+                                ports=[client.V1ContainerPort(container_port=config['port'])]
+                            )
+                        ]
+                    )
+                )
+            )
         )
-        tx = contract.functions[step['function']](
-            *step['args']
-        ).build_transaction({
-            'from': self.config['wallet_address'],
-            'gasPrice': self.w3.toWei('50', 'gwei'),
-            'nonce': self.w3.eth.getTransactionCount(self.config['wallet_address'])
-        })
-        signed_tx = self.w3.eth.account.signTransaction(tx, private_key=self.config['private_key'])
-        tx_hash = self.w3.eth.sendRawTransaction(signed_tx.rawTransaction)
-        tx_receipt = self.w3.eth.waitForTransactionReceipt(tx_hash)
-        return tx_receipt
+        self.api.create_namespaced_deployment(namespace='default', body=deployment)
+
+    def create_service(self, service: str, config: Dict) -> None:
+        service_obj = client.V1Service(
+            metadata=client.V1ObjectMeta(name=service),
+            spec=client.V1ServiceSpec(
+                selector={'app': service},
+                ports=[client.V1ServicePort(port=config['port'])]
+            )
+        )
+        self.api.create_namespaced_service(namespace='default', body=service_obj)
