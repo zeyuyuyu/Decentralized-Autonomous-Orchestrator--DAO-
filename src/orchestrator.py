@@ -1,52 +1,41 @@
 import os
-import yaml
-from typing import Dict, List
-from kubernetes import client, config
+import time
+import random
+import multiprocessing as mp
 
-class DeploymentOrchestrator:
-    def __init__(self, config_file: str = 'config.yaml'):
-        with open(config_file, 'r') as f:
-            self.config = yaml.safe_load(f)
-        
-        config.load_kube_config()
-        self.api = client.AppsV1Api()
+class AutonomousOrchestrator:
+    def __init__(self, num_workers=4, max_load=80):
+        self.num_workers = num_workers
+        self.max_load = max_load
+        self.worker_processes = []
+        self.start_workers()
 
-    def deploy_services(self, services: List[str]) -> None:
-        for service in services:
-            service_config = self.config['services'][service]
-            self.create_deployment(service, service_config)
-            self.create_service(service, service_config)
+    def start_workers(self):
+        for _ in range(self.num_workers):
+            process = mp.Process(target=self.worker_loop)
+            process.start()
+            self.worker_processes.append(process)
 
-    def create_deployment(self, service: str, config: Dict) -> None:
-        deployment = client.V1Deployment(
-            metadata=client.V1ObjectMeta(name=service),
-            spec=client.V1DeploymentSpec(
-                replicas=config['replicas'],
-                selector=client.V1LabelSelector(
-                    match_labels={'app': service}
-                ),
-                template=client.V1PodTemplateSpec(
-                    metadata=client.V1ObjectMeta(labels={'app': service}),
-                    spec=client.V1PodSpec(
-                        containers=[
-                            client.V1Container(
-                                name=service,
-                                image=config['image'],
-                                ports=[client.V1ContainerPort(container_port=config['port'])]
-                            )
-                        ]
-                    )
-                )
-            )
-        )
-        self.api.create_namespaced_deployment(namespace='default', body=deployment)
+    def worker_loop(self):
+        while True:
+            # Simulate some work
+            work_duration = random.uniform(1, 5)
+            time.sleep(work_duration)
 
-    def create_service(self, service: str, config: Dict) -> None:
-        service_obj = client.V1Service(
-            metadata=client.V1ObjectMeta(name=service),
-            spec=client.V1ServiceSpec(
-                selector={'app': service},
-                ports=[client.V1ServicePort(port=config['port'])]
-            )
-        )
-        self.api.create_namespaced_service(namespace='default', body=service_obj)
+            # Check the system load
+            load = os.getloadavg()[0]
+            if load > self.max_load:
+                # Scale up by starting a new worker
+                new_process = mp.Process(target=self.worker_loop)
+                new_process.start()
+                self.worker_processes.append(new_process)
+                print(f'Scaled up, now have {len(self.worker_processes)} workers')
+            elif len(self.worker_processes) > self.num_workers:
+                # Scale down by terminating a worker
+                worker_to_terminate = self.worker_processes.pop()
+                worker_to_terminate.terminate()
+                print(f'Scaled down, now have {len(self.worker_processes)} workers')
+
+if __name__ == '__main__':
+    orchestrator = AutonomousOrchestrator()
+    orchestrator.start_workers()
