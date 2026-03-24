@@ -1,49 +1,58 @@
+import os
+import json
 import time
-import threading
-import logging
-
-class TaskScheduler:
-    def __init__(self, max_concurrent_tasks=5):
-        self.max_concurrent_tasks = max_concurrent_tasks
-        self.task_queue = []
-        self.active_tasks = []
-        self.lock = threading.Lock()
-
-    def schedule_task(self, task):
-        with self.lock:
-            self.task_queue.append(task)
-            self.process_queue()
-
-    def process_queue(self):
-        while len(self.active_tasks) < self.max_concurrent_tasks and self.task_queue:
-            task = self.task_queue.pop(0)
-            self.active_tasks.append(task)
-            threading.Thread(target=self.execute_task, args=(task,)).start()
-
-    def execute_task(self, task):
-        try:
-            task.execute()
-        except Exception as e:
-            logging.error(f"Error executing task: {e}")
-        finally:
-            with self.lock:
-                self.active_tasks.remove(task)
-                self.process_queue()
-
-class Task:
-    def __init__(self, name, function, *args, **kwargs):
-        self.name = name
-        self.function = function
-        self.args = args
-        self.kwargs = kwargs
-
-    def execute(self):
-        self.function(*self.args, **self.kwargs)
+import asyncio
+import requests
+from web3 import Web3
 
 class Orchestrator:
-    def __init__(self):
-        self.task_scheduler = TaskScheduler()
+    def __init__(self, config_path='config.json'):
+        with open(config_path, 'r') as f:
+            self.config = json.load(f)
+        self.chains = {}
+        self.connect_chains()
 
-    def run_task(self, name, function, *args, **kwargs):
-        task = Task(name, function, *args, **kwargs)
-        self.task_scheduler.schedule_task(task)
+    def connect_chains(self):
+        for chain in self.config['chains']:
+            w3 = Web3(Web3.HTTPProvider(chain['rpc_url']))
+            self.chains[chain['name']] = {
+                'web3': w3,
+                'contracts': {}
+            }
+            for contract in chain['contracts']:
+                contract_instance = w3.eth.contract(
+                    address=contract['address'],
+                    abi=contract['abi']
+                )
+                self.chains[chain['name']]['contracts'][contract['name']] = contract_instance
+
+    async def execute_cross_chain_transaction(self, source_chain, target_chain, contract_name, function_name, args):
+        source_web3 = self.chains[source_chain]['web3']
+        target_web3 = self.chains[target_chain]['web3']
+        source_contract = self.chains[source_chain]['contracts'][contract_name]
+        target_contract = self.chains[target_chain]['contracts'][contract_name]
+
+        # Step 1: Call function on source chain
+        tx_hash = source_contract.functions[function_name](*args).transact()
+        tx_receipt = source_web3.eth.waitForTransactionReceipt(tx_hash)
+
+        # Step 2: Monitor for event on source chain
+        event_filter = source_contract.events[self.config['cross_chain_event']].createFilter(fromBlock='latest')
+        while True:
+            events = event_filter.get_new_entries()
+            if events:
+                break
+            await asyncio.sleep(1)
+
+        # Step 3: Call function on target chain
+        tx_hash = target_contract.functions[function_name](*args).transact()
+        tx_receipt = target_web3.eth.waitForTransactionReceipt(tx_hash)
+
+        return tx_receipt
+
+if __name__ == '__main__':
+    orchestrator = Orchestrator()
+    tx_receipt = asyncio.run(orchestrator.execute_cross_chain_transaction(
+        'ethereum', 'polygon', 'MyContract', 'myFunction', [arg1, arg2]
+    ))
+    print(tx_receipt)
